@@ -5,9 +5,11 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import providers
 from context_budget import trim_messages
 from providers import fix_seam, strip_think
 from tools import run_python
+from tools_apps import pdf_tutor
 
 
 class Msg:
@@ -81,3 +83,46 @@ async def test_python_tool_runs_bounded_snippets():
 async def test_python_tool_rejects_imports_and_attribute_access():
     assert "unsupported statement: Import" in await run_python("import os")
     assert "unsupported syntax: Attribute" in await run_python("().__class__")
+
+
+@pytest.mark.asyncio
+async def test_python_tool_preserves_short_circuit_values_and_augmented_assignment():
+    code = (
+        'n = 0\n'
+        'print(n != 0 and 10 / n)\n'
+        'print("a" or "b")\n'
+        'values = [1]\n'
+        'values += [2]\n'
+        'print(values)'
+    )
+    assert await run_python(code) == "False\na\n[1, 2]"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "expression",
+    [
+        '"a" * 2000000000',
+        '2000000000 * "a"',
+        '"a" * 1000000000000000000',
+        '1000000000000000000 * "a"',
+    ],
+)
+async def test_python_tool_checks_string_multiplication_before_allocation(expression):
+    result = await run_python(expression)
+    assert "result exceeds the 10,000-item limit" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tokens", [[], ["<think>private reasoning</think>"]])
+async def test_pdf_query_rewrite_falls_back_when_provider_output_is_empty(monkeypatch, tokens):
+    async def fake_stream(*args, **kwargs):
+        for token in tokens:
+            yield "token", {"text": token}
+        yield "done", {}
+
+    monkeypatch.setattr(providers, "stream_with_failover", fake_stream)
+    question = "What does the report conclude?"
+    history = [pdf_tutor.HistoryMessage(role="user", content="Earlier question")]
+
+    assert await pdf_tutor.rewrite_query(question, history) == question

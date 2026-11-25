@@ -83,6 +83,35 @@ async def run_python(code: str) -> str:
                 raise ValueError("integer result is too large")
             return value
 
+        def apply_binary(op, left, right, in_place=False):
+            ops = {
+                ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+                ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
+                ast.Mod: operator.mod, ast.Pow: operator.pow,
+            }
+            if isinstance(op, ast.Pow) and (not isinstance(right, (int, float)) or abs(right) > 12):
+                raise ValueError("exponent is outside the allowed range")
+            if isinstance(op, ast.Mult):
+                sequence = None
+                multiplier = None
+                if isinstance(left, (str, list, tuple)) and isinstance(right, int):
+                    sequence, multiplier = left, right
+                elif isinstance(right, (str, list, tuple)) and isinstance(left, int):
+                    sequence, multiplier = right, left
+                if sequence is not None and len(sequence) * max(multiplier, 0) > 10_000:
+                    raise ValueError("result exceeds the 10,000-item limit")
+            fn = ops.get(type(op))
+            if fn is None:
+                raise ValueError("unsupported operator")
+            if in_place:
+                fn = {
+                    ast.Add: operator.iadd, ast.Sub: operator.isub,
+                    ast.Mult: operator.imul, ast.Div: operator.itruediv,
+                    ast.FloorDiv: operator.ifloordiv, ast.Mod: operator.imod,
+                    ast.Pow: operator.ipow,
+                }.get(type(op), fn)
+            return checked(fn(left, right))
+
         def evaluate(node):
             if isinstance(node, ast.Constant):
                 if not isinstance(node.value, (str, int, float, bool, type(None))):
@@ -101,20 +130,7 @@ async def run_python(code: str) -> str:
                 return checked({evaluate(k): evaluate(v) for k, v in zip(node.keys, node.values)})
             if isinstance(node, ast.BinOp):
                 left, right = evaluate(node.left), evaluate(node.right)
-                ops = {
-                    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
-                    ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
-                    ast.Mod: operator.mod, ast.Pow: operator.pow,
-                }
-                fn = ops.get(type(node.op))
-                if fn is None:
-                    raise ValueError("unsupported operator")
-                if isinstance(node.op, ast.Pow) and (not isinstance(right, (int, float)) or abs(right) > 12):
-                    raise ValueError("exponent is outside the allowed range")
-                if isinstance(node.op, ast.Mult) and isinstance(left, (str, list, tuple)) and isinstance(right, int):
-                    if len(left) * max(right, 0) > 10_000:
-                        raise ValueError("result exceeds the 10,000-item limit")
-                return checked(fn(left, right))
+                return apply_binary(node.op, left, right)
             if isinstance(node, ast.UnaryOp):
                 ops = {ast.UAdd: operator.pos, ast.USub: operator.neg, ast.Not: operator.not_}
                 fn = ops.get(type(node.op))
@@ -122,8 +138,12 @@ async def run_python(code: str) -> str:
                     raise ValueError("unsupported unary operator")
                 return checked(fn(evaluate(node.operand)))
             if isinstance(node, ast.BoolOp):
-                values = [evaluate(item) for item in node.values]
-                return all(values) if isinstance(node.op, ast.And) else any(values)
+                is_and = isinstance(node.op, ast.And)
+                for item in node.values:
+                    value = evaluate(item)
+                    if (is_and and not value) or (not is_and and value):
+                        return value
+                return value
             if isinstance(node, ast.Compare):
                 left = evaluate(node.left)
                 ops = {
@@ -185,12 +205,11 @@ async def run_python(code: str) -> str:
                     environment[statement.target.id] = evaluate(statement.value)
                     last = None
                 elif isinstance(statement, ast.AugAssign) and isinstance(statement.target, ast.Name):
-                    environment[statement.target.id] = evaluate(
-                        ast.BinOp(
-                            left=ast.Constant(environment[statement.target.id]),
-                            op=statement.op,
-                            right=statement.value,
-                        )
+                    environment[statement.target.id] = apply_binary(
+                        statement.op,
+                        environment[statement.target.id],
+                        evaluate(statement.value),
+                        in_place=True,
                     )
                     last = None
                 elif isinstance(statement, ast.If):
@@ -212,6 +231,8 @@ async def run_python(code: str) -> str:
         last = execute(tree.body)
         result = "\n".join(output) if output else repr(last)
         return (result.strip() or "(no output)")[:8000]
+    except MemoryError:
+        return "Python tool error: result exceeds available memory."
     except (SyntaxError, ValueError, TypeError, ZeroDivisionError, OverflowError, KeyError, IndexError, RecursionError) as exc:
         return f"Python tool error: {exc}"
 

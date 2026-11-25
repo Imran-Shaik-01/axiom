@@ -344,6 +344,12 @@ def _mark_circuit(name: str, ok: bool) -> None:
         circuit_fails[name] = 0
 
 
+def _should_count_circuit_failure(error: Exception) -> bool:
+    if isinstance(error, ProviderError):
+        return error.status == 429 or 500 <= error.status <= 599
+    return isinstance(error, httpx.TimeoutException)
+
+
 def pick_node(tried: set, needs_vision: bool = False, extra_keys: dict | None = None,
               mode: str | None = None, pin_provider: str | None = None, pin_model: str | None = None):
     """Returns the first usable (provider, key_index, key, model), or None.
@@ -355,7 +361,8 @@ def pick_node(tried: set, needs_vision: bool = False, extra_keys: dict | None = 
         cfg = PROVIDERS.get(name)
         if not cfg:
             continue
-        keys = [extra_keys[name]] if extra_keys.get(name) else cfg["keys"]
+        byok_key = extra_keys.get(name)
+        keys = [byok_key] if byok_key else cfg["keys"]
         if not keys:
             continue
         models_pool = cfg["vision_models"] if needs_vision else cfg["models"]
@@ -363,19 +370,23 @@ def pick_node(tried: set, needs_vision: bool = False, extra_keys: dict | None = 
             models_pool = [pin_model] + [m for m in models_pool if m != pin_model]
         if not models_pool:
             continue
-        start = _rr.get(name, 0) % len(keys)
+        start = 0 if byok_key else _rr.get(name, 0) % len(keys)
         for offset in range(len(keys)):
             i = (start + offset) % len(keys)
-            if cooldown_until.get((name, i), 0) > now:
+            key_index = "byok" if byok_key else i
+            if not byok_key and cooldown_until.get((name, key_index), 0) > now:
                 continue
             for model in models_pool:
-                node_id = (name, i, model)
-                if node_id in tried or cooldown_until.get(node_id, 0) > now:
+                node_id = (name, key_index, model)
+                if node_id in tried or (
+                    not byok_key and cooldown_until.get(node_id, 0) > now
+                ):
                     continue
-                if model_cooldown.get((name, model), 0) > now:
+                if not byok_key and model_cooldown.get((name, model), 0) > now:
                     continue
-                _rr[name] = i + 1
-                return name, i, keys[i], model
+                if not byok_key:
+                    _rr[name] = i + 1
+                return name, key_index, keys[i], model
     return None
 
 
@@ -404,8 +415,9 @@ async def stream_with_failover(
         node = pick_node(tried, needs_vision, extra_keys, mode, pin_provider, pin_model)
         if node is None:
             break
-        name, i, key, model = node
-        node_id = (name, i, model)
+        name, key_index, key, model = node
+        is_byok = key_index == "byok"
+        node_id = (name, key_index, model)
 
         current = list(messages)
         visible = strip_think(partial)  # never feed another model's private reasoning back in
@@ -452,7 +464,12 @@ async def stream_with_failover(
                         metrics.observe("axiom_ttft_ms", ttft, provider=name)
                         current_active_model[name] = model
                         PROVIDERS[name]["model"] = model
-                        logutil.log("provider_selected", provider=name, key_index=i + 1, model=model)
+                        logutil.log(
+                            "provider_selected",
+                            provider=name,
+                            key_index="byok" if is_byok else key_index + 1,
+                            model=model,
+                        )
                         yield "meta", {"provider": name, "model": model}
                         if switched:
                             yield "status", {"message": f"Switched provider to {name}"}
@@ -467,7 +484,8 @@ async def stream_with_failover(
                 raise ProviderError(502, "empty response")
 
             record_success(name, switched and not internal)
-            _mark_circuit(name, True)
+            if not is_byok:
+                _mark_circuit(name, True)
             yield "timeline", {"t": time.time(), "provider": name, "model": model, "phase": "ok"}
             yield "done", {}
             return
@@ -475,11 +493,12 @@ async def stream_with_failover(
         except (ProviderError, httpx.TimeoutException, httpx.TransportError) as e:
             tried.add(node_id)
             secs = cooldown_seconds(e) if isinstance(e, ProviderError) else 30
-            cooldown_until[node_id] = time.time() + secs
-            if isinstance(e, ProviderError) and e.status in (401, 403):
-                cooldown_until[(name, i)] = time.time() + 3600
-            elif isinstance(e, ProviderError) and e.status == 404:
-                model_cooldown[(name, model)] = time.time() + 3600
+            if not is_byok:
+                cooldown_until[node_id] = time.time() + secs
+                if isinstance(e, ProviderError) and e.status in (401, 403):
+                    cooldown_until[(name, key_index)] = time.time() + 3600
+                elif isinstance(e, ProviderError) and e.status == 404:
+                    model_cooldown[(name, model)] = time.time() + 3600
             switched = True
             if isinstance(e, ProviderError):
                 detail = f"{e.status} {e.detail[:200]}"
@@ -490,13 +509,14 @@ async def stream_with_failover(
             logutil.log(
                 "provider_failure",
                 provider=name,
-                key_index=i + 1,
+                key_index="byok" if is_byok else key_index + 1,
                 model=model,
                 reason=failure_reason,
                 cooldown_seconds=int(secs),
             )
             record_failure(name, e)
-            _mark_circuit(name, False)
+            if not is_byok and _should_count_circuit_failure(e):
+                _mark_circuit(name, False)
             yield "timeline", {"t": time.time(), "provider": name, "model": model, "phase": "fail", "detail": detail[:120]}
 
         finally:
@@ -548,20 +568,24 @@ async def complete_with_failover(
         node = pick_node(tried, False, extra_keys, mode, pin_provider, pin_model)
         if node is None:
             break
-        name, i, key, model = node
-        node_id = (name, i, model)
+        name, key_index, key, model = node
+        is_byok = key_index == "byok"
+        node_id = (name, key_index, model)
         try:
             data = await complete_one(get_client(), name, key, model, messages, tools)
             current_active_model[name] = model
-            _mark_circuit(name, True)
+            if not is_byok:
+                _mark_circuit(name, True)
             record_success(name, False)
             return name, model, data
         except (ProviderError, httpx.TimeoutException, httpx.TransportError) as e:
             tried.add(node_id)
             secs = cooldown_seconds(e) if isinstance(e, ProviderError) else 30
-            cooldown_until[node_id] = time.time() + secs
+            if not is_byok:
+                cooldown_until[node_id] = time.time() + secs
             record_failure(name, e)
-            _mark_circuit(name, False)
+            if not is_byok and _should_count_circuit_failure(e):
+                _mark_circuit(name, False)
     return None, None, None
 
 

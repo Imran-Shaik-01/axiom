@@ -131,7 +131,8 @@ async def rewrite_query(question: str, history: list["HistoryMessage"]) -> str:
             return text
 
         rewritten = await asyncio.wait_for(generate(), timeout=12)
-        rewritten = providers.strip_think(rewritten).splitlines()[0].strip(" \"'`")[:1000]
+        lines = providers.strip_think(rewritten).splitlines()
+        rewritten = lines[0].strip(" \"'`")[:1000] if lines else ""
         return rewritten or question[:1000]
     except asyncio.TimeoutError:
         logutil.log("pdf_query_rewrite_failed", reason="timeout")
